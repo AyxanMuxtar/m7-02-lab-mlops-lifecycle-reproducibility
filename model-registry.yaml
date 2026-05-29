@@ -1,0 +1,107 @@
+registry:
+  name: northstar-models
+  backend: MLflow Model Registry (self-hosted, PostgreSQL store)
+
+  stages:
+    - name: staging
+      promoted_from: >
+        A training run artifact (run_<run_id>/model.onnx) that has passed
+        the automated evaluation script in CI. The CI job registers the model
+        and sets stage to Staging automatically on pass.
+      promotion_rule: automatic
+      gates:
+        # ETA model gates (evaluated on frozen holdout: eval_set_2024Q4.parquet)
+        - eta_mae_minutes <= 4.2            # overall MAE on holdout set
+        - eta_mae_per_city_minutes <= 7.0   # worst-city MAE (bottom 3 cities by volume)
+        - eta_p90_error_minutes <= 9.0      # P90 absolute error across all cities
+        - unit_tests_pass: true             # pytest northstar/tests/ exit 0
+        - schema_validation_pass: true      # ONNX input/output shape matches serving contract
+        # Dispatcher model gates (evaluated on frozen holdout: dispatch_holdout_2024Q4.parquet)
+        - dispatcher_macro_f1 >= 0.82
+        - dispatcher_per_courier_f1_bottom3 >= 0.70   # F1 on the 3 couriers with lowest volume
+        - dispatcher_precision >= 0.78
+
+    - name: production
+      promoted_from: staging
+      promotion_rule: manual
+      gates:
+        - canary_p95_latency_ms <= 150      # measured over 30-minute canary window at 10% traffic
+        - canary_error_rate_pct <= 0.5      # HTTP 5xx from inference service during canary
+        - shadow_mae_delta_minutes <= 0.3   # shadow-mode MAE vs current Production model on live traffic
+        - no_regression_on_slice:           # must not regress on long-haul routes (>100 km)
+            slice: route_distance_km > 100
+            metric: mae_minutes
+            max_allowed_increase: 0.5
+      approvers:
+        - ml-lead         # tech sign-off: reviews eval_<run_id>.json + canary dashboard
+        - product-owner   # business sign-off: confirms release timing and customer impact
+
+    - name: archived
+      promoted_from: >
+        production — triggered automatically when a newer model version is
+        promoted to Production. The superseded Production version moves to
+        Archived immediately. Versions also move to Archived if they have been
+        in Staging for more than 30 days without promotion (stale candidate cleanup).
+      promotion_rule: automatic
+      retention_policy:
+        registry_versions_kept: 10          # oldest versions beyond 10 are deleted from registry
+        s3_artifact_retention_days: 90      # model.onnx kept in S3 for 90 days after archival
+
+
+models:
+  - name: eta
+    owner: ml-platform-team
+    description: Predicts delivery arrival time. Online inference.
+    inference_pattern: online
+    rps_target: 200
+    sla_p95_ms: 150
+    retraining_cadence: every_14_days
+    drift_check_cadence: daily
+    retention_versions: 10
+    eval_holdout_dataset: s3://northstar-data/eval/eta/eval_set_2024Q4.parquet
+    eval_holdout_hash: sha256:a3f7c2d18b9e0451f6c...  # pinned; never regenerated mid-cycle
+
+  - name: dispatcher-routing
+    owner: routing-team
+    description: Selects optimal courier for each pickup. Online inference.
+    inference_pattern: online
+    rps_target: 50
+    sla_p95_ms: 80
+    retraining_cadence: every_30_days
+    drift_check_cadence: daily
+    retention_versions: 10
+    eval_holdout_dataset: s3://northstar-data/eval/dispatch/dispatch_holdout_2024Q4.parquet
+    eval_holdout_hash: sha256:b9d4e1f03c7a2856d1e...
+
+
+lineage:
+  # Every model version registered in the registry MUST carry these fields.
+  # Registration fails (CI script exits non-zero) if any field is missing or empty.
+  required_fields:
+    - git_sha              # exact commit hash of training code used to produce the run
+    - dataset_hash         # DVC content hash of the versioned training dataset (sha256)
+    - docker_image_digest  # sha256 digest of the northstar-trainer Docker image used
+    - run_id               # MLflow run ID — links to params.yaml, metrics.json, artifacts
+    - eval_holdout_hash    # sha256 of the frozen evaluation dataset (must match model's registered hash)
+    - seed                 # integer random seed passed to trainer (for reproducibility audit)
+
+
+monitoring:
+  # Signals that trigger automatic retraining DAG in Airflow
+  drift_triggers:
+    - signal: feature_psi_breach
+      description: >
+        Population Stability Index (PSI) on any of the top-5 input features
+        (hour_of_day, route_distance_km, weather_condition, courier_load, region_id)
+        exceeds 0.2 over a 24-hour sliding window.
+      action: trigger_retraining_dag
+    - signal: mae_regression
+      description: >
+        Rolling 6-hour mean absolute error on live shadow predictions exceeds
+        current Production model's holdout MAE by more than 15%.
+      action: page_ml_lead + trigger_retraining_dag
+    - signal: scheduled_retraining
+      description: >
+        14 days have elapsed since last Production promotion for ETA model;
+        30 days for dispatcher-routing model.
+      action: trigger_retraining_dag
